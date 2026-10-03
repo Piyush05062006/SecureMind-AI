@@ -1,0 +1,19 @@
+.env
+
+.venv/
+venv/
+env/
+
+*.pt
+yolov8n.pt
+# Project Data (Generated video clips)
+data/
+*.mp4
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+.vscode/
+.DS_Store
+Screenshot 2026-09-04 112831.png
