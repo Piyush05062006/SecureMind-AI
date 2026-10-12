@@ -4,13 +4,18 @@ import os
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
 from typing import TypedDict, List
 from langchain_core.messages import HumanMessage
-from langchain_groq import ChatGroq
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
 from app.db.database import SessionLocal
 from app.db.models import Incident
+from dotenv import load_dotenv
 
+# Force the thread to load your .env credentials
+load_dotenv()
 
 class SecurityState(TypedDict):
     item_id: int
@@ -27,14 +32,13 @@ def extract_keyframes(state: SecurityState) -> dict:
     if total_frames <= 0:
         return {"frames_b64": []}
 
-    indices = [0, total_frames // 4, total_frames // 2, (3 * total_frames) // 4, total_frames - 1] #Keyframes (Start, 25%, 50%, 75%, End)
+    indices = [0, total_frames // 4, total_frames // 2, (3 * total_frames) // 4, total_frames - 1] 
     frames_b64 = []
 
     for idx in indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         success, frame = cap.read()
         if success:
-            # Resize frame down to 640px to reduce token consumption and speed up inference
             h, w = frame.shape[:2]
             scaled_frame = cv2.resize(frame, (640, int(h * (640 / w))))
             _, buffer = cv2.imencode(".jpg", scaled_frame)
@@ -52,12 +56,12 @@ def evaluate_displacement(state: SecurityState) -> dict:
     if not frames:
         return {"is_false_alarm": True, "reasoning": "Failed to extract video frames."}
 
-    llm = ChatGroq(
-        model="llama-3.2-90b-vision-preview", 
+    # Initializing the current active Gemini model
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash", 
         temperature=0
     )
 
-    # Build multimodal content payload
     content = [
         {
             "type": "text",
@@ -82,23 +86,29 @@ def evaluate_displacement(state: SecurityState) -> dict:
         })
 
     response = llm.invoke([HumanMessage(content=content)])
-    res_text = response.content
+    
+    # Safely extract the text whether it is a string or a list of dictionaries
+    if isinstance(response.content, list):
+        res_text = response.content[0].get("text", "")
+    else:
+        res_text = str(response.content)
 
     is_false_alarm = "STATUS: FALSE_ALARM" in res_text
     reasoning = res_text.split("REASONING:")[-1].strip() if "REASONING:" in res_text else res_text
+    
     return {"is_false_alarm": is_false_alarm, "reasoning": reasoning}
 
 
 def decide_route(state: SecurityState) -> str:
     return "handle_false_alarm" if state["is_false_alarm"] else "trigger_verified_alarm"
 
-#  Handle Verified Alarms (Log to MySQL + Send Alert)
+
 def trigger_verified_alarm(state: SecurityState) -> dict:
     item_id = state["item_id"]
     video_path = state["video_path"]
     reasoning = state["reasoning"]
 
-    print(f"\n [CONFIRMED INCIDENT] Item #{item_id} is missing!")
+    print(f"\n🚨 [CONFIRMED INCIDENT] Item #{item_id} is missing!")
     print(f"Reasoning: {reasoning}")
 
     db = SessionLocal()
@@ -113,42 +123,35 @@ def trigger_verified_alarm(state: SecurityState) -> dict:
         db.commit()
     finally:
         db.close()
-
+        
     send_email_alert(item_id, video_path, reasoning)
-
     return {}
 
 
 def handle_false_alarm(state: SecurityState) -> dict:
-    print(f"\n [FALSE ALARM SUPPRESSED] Item #{state['item_id']} was just obscured.")
+    print(f"\n🛡️ [FALSE ALARM SUPPRESSED] Item #{state['item_id']} was just obscured.")
     print(f"Reasoning: {state['reasoning']}")
 
-    # Optional: Log false alarm in MySQL for audit records
-    db = SessionLocal()
-    try:
-        incident = Incident(
-            item_id=state["item_id"],
-            video_path=state["video_path"],
-            is_false_alarm=True,
-            agent_reasoning=state["reasoning"]
-        )
-        db.add(incident)
-        db.commit()
-    finally:
-        db.close()
+    video_path = state["video_path"]
+    if os.path.exists(video_path):
+        try:
+            os.remove(video_path)
+            print(f"🗑️ Deleted false alarm video: {video_path}")
+        except Exception as e:
+            print(f"❌ Could not delete video {video_path}: {e}")
 
     return {}
 
+
 def send_email_alert(item_id: int, video_path: str, reasoning: str):
-    """Utility to send an incident notification via  Simple Mail Transfer Protocol."""
-    sender_email = os.getenv("ALERT_EMAIL_SENDER", "security@example.com")
-    receiver_email = os.getenv("ALERT_EMAIL_RECEIVER", "admin@example.com")
-    smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com") #Which mail server should I connect to to send the email? 
+    sender_email = os.getenv("ALERT_EMAIL_SENDER")
+    receiver_email = os.getenv("ALERT_EMAIL_RECEIVER")
+    smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com") 
     smtp_port = int(os.getenv("SMTP_PORT", "587"))
-    smtp_password = os.getenv("SMTP_PASSWORD", "")
+    smtp_password = os.getenv("SMTP_PASSWORD")
 
     if not smtp_password:
-        print("⚠️ SMTP credentials not set. Skipping email dispatch.")
+        print("❌ SMTP credentials not found in .env file. Skipping email dispatch.")
         return
 
     msg = MIMEMultipart()
@@ -156,19 +159,36 @@ def send_email_alert(item_id: int, video_path: str, reasoning: str):
     msg["To"] = receiver_email
     msg["Subject"] = f"CRITICAL ALERT: Object #{item_id} Missing"
 
-    body = f"Incident Detected!\n\nItem ID: {item_id}\nEvidence Clip: {video_path}\nAI Analysis: {reasoning}"
+    body = f"Incident Detected!\n\nItem ID: {item_id}\nAI Analysis: {reasoning}\n\nPlease review the attached evidentiary video clip."
     msg.attach(MIMEText(body, "plain"))
+
+    if os.path.exists(video_path):
+        try:
+            with open(video_path, "rb") as attachment:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(attachment.read())
+            
+            encoders.encode_base64(part)
+            part.add_header(
+                "Content-Disposition",
+                f"attachment; filename={os.path.basename(video_path)}",
+            )
+            msg.attach(part)
+        except Exception as e:
+            print(f"❌ Failed to attach video file {video_path}: {e}")
+    else:
+        print(f"⚠️ Video file {video_path} not found on disk. Sending email without attachment.")
 
     try:
         with smtplib.SMTP(smtp_server, smtp_port) as server:
             server.starttls()
             server.login(sender_email, smtp_password)
             server.send_message(msg)
-            print(" Alert email sent successfully.")
+            print("✅ Alert email sent successfully with video attachment.")
     except Exception as e:
-        print(f"Failed to send email: {e}")
+        print(f"❌ Failed to send email: {e}")
 
-#  Compile the LangGraph
+
 workflow = StateGraph(SecurityState)
 workflow.add_node("extract_keyframes", extract_keyframes)
 workflow.add_node("evaluate_displacement", evaluate_displacement)
@@ -191,7 +211,8 @@ workflow.add_edge("handle_false_alarm", END)
 security_agent = workflow.compile()
 
 def verify_incident(video_path: str, item_id: int):
-    """Entry point called by the Vision Service."""
+    print(f"\n🧠 [AGENT STARTING] LangGraph (Gemini Vision) is analyzing video for Item #{item_id}. Please wait...")
+    
     initial_state = {
         "item_id": item_id,
         "video_path": video_path,
@@ -199,4 +220,9 @@ def verify_incident(video_path: str, item_id: int):
         "is_false_alarm": False,
         "reasoning": ""
     }
-    security_agent.invoke(initial_state)
+    
+    try:
+        security_agent.invoke(initial_state)
+        print(f"✅ [AGENT FINISHED] Analysis complete for Item #{item_id}.")
+    except Exception as e:
+        print(f"\n❌ [AGENT CRASHED] LangGraph encountered an error: {e}")

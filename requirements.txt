@@ -5,3 +5,5 @@ pymysql
 opencv-python
 ultralytics
 python-dotenv
+opencv-contrib-python
+langgraph langchain-groq
