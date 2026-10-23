@@ -1,9 +1,11 @@
+
 fastapi
 uvicorn
 SQLAlchemy
 pymysql
-opencv-python
+opencv-contrib-python
 ultralytics
 python-dotenv
-opencv-contrib-python
-langgraph langchain-groq
+langgraph
+langchain-core
+langchain-google-genai

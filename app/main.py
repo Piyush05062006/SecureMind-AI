@@ -14,6 +14,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 app.include_router(camera.router, prefix="/api/camera", tags=["Camera Control"])
 app.include_router(incidents.router, prefix="/api/incidents", tags=["Incident Logs"])
 
